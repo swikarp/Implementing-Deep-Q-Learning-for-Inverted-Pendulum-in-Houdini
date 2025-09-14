@@ -1,0 +1,257 @@
+node = hou.pwd()
+geo = node.geometry()
+
+# Add code to modify contents of geo.
+# Use drop down menu to select examples.
+import numpy as np
+import random
+import hou
+
+# -----------------------------
+# 1) Custom CartPole environment
+# -----------------------------
+class CartPoleEnv:
+    def __init__(self):
+        self.gravity = 9.8
+        self.mass_cart = 1.0
+        self.mass_pole = 0.5
+        self.total_mass = self.mass_cart + self.mass_pole
+        self.length = 0.5  # half-pole length
+        self.tau = 0.02  # seconds per step
+        self.state = None
+        self.reset()
+
+    def reset(self):
+        self.state = np.random.uniform(low=-0.05, high=0.05, size=(4,))
+        return self.state
+
+    def step(self, action):
+        x, x_dot, theta, theta_dot = self.state
+        F = 10.0 if action == 1 else -10.0
+        m = self.mass_pole
+        M = self.mass_cart
+        l = self.length
+        g = self.gravity
+
+        costheta = np.cos(theta)
+        sintheta = np.sin(theta)
+
+        # --- New formulas ---
+        xacc = (F + m * l * theta_dot**2 - m * g * l * sintheta * costheta) / (M + m - m * costheta**2)
+        thetaacc = (g * sintheta - costheta * xacc) / l
+
+        # Euler integration
+        x = x + self.tau * x_dot
+        x_dot = x_dot + self.tau * xacc
+        theta = theta + self.tau * theta_dot
+        theta_dot = theta_dot + self.tau * thetaacc
+
+        self.state = np.array([x, x_dot, theta, theta_dot])
+
+        done = bool(
+            x < -10.0 or x > 10.0 or
+            theta < -12*np.pi/180 or theta > 12*np.pi/180
+        )
+        reward = 1.0 if not done else 0.0
+        return self.state, reward, done
+
+
+# -----------------------------
+# 2) DQN Neural Network
+# -----------------------------
+class DQN:
+    def __init__(self, input_dim, output_dim, hidden_dim=24, lr=0.01):
+        self.lr = lr
+        self.W1 = np.random.randn(input_dim, hidden_dim) * 0.1
+        self.b1 = np.zeros(hidden_dim)
+        self.W2 = np.random.randn(hidden_dim, output_dim) * 0.1
+        self.b2 = np.zeros(output_dim)
+
+    def forward(self, x):
+        self.z1 = np.dot(x, self.W1) + self.b1
+        self.a1 = np.tanh(self.z1)
+        self.z2 = np.dot(self.a1, self.W2) + self.b2
+        return self.z2
+
+    def backward(self, x, target, output):
+        error = output - target
+        dW2 = np.outer(self.a1, error)
+        db2 = error
+        da1 = np.dot(self.W2, error)
+        dz1 = da1 * (1 - self.a1**2)
+        dW1 = np.outer(x, dz1)
+        db1 = dz1
+
+        self.W1 -= self.lr * dW1
+        self.b1 -= self.lr * db1
+        self.W2 -= self.lr * dW2
+        self.b2 -= self.lr * db2
+
+# -----------------------------
+# 3) Global state management using Houdini session data
+# -----------------------------
+def get_session_data():
+    """Get or initialize session data for persistent training state"""
+    session_data = hou.session.__dict__
+    
+    if 'rl_env' not in session_data:
+        # Initialize training state
+        session_data['rl_env'] = CartPoleEnv()
+        session_data['rl_dqn'] = DQN(4, 2)
+        session_data['rl_episode'] = 0
+        session_data['rl_step'] = 0
+        session_data['rl_total_reward'] = 0
+        session_data['rl_epsilon'] = 1.0
+        session_data['rl_state'] = session_data['rl_env'].reset()
+        session_data['rl_done'] = False
+        session_data['rl_gamma'] = 0.95
+        session_data['rl_epsilon_min'] = 0.01
+        session_data['rl_epsilon_decay'] = 0.995
+        session_data['rl_max_episodes'] = 500
+        session_data['rl_max_steps'] = 200
+        print("Initialized new RL training session")
+    
+    return session_data
+
+def reset_training():
+    """Reset training state - call this to start over"""
+    session_data = hou.session.__dict__
+    for key in list(session_data.keys()):
+        if key.startswith('rl_'):
+            del session_data[key]
+    print("Training state reset")
+
+# -----------------------------
+# 4) Main execution per frame
+# -----------------------------
+node = hou.pwd()
+geo = node.geometry()
+
+# Make sure 2 points exist
+if len(geo.points()) < 2:
+    geo.clear()
+    geo.createPoints([hou.Vector3(0,0,0), hou.Vector3(0,1,0)])
+
+# Get current frame and persistent session data
+frame = hou.frame()
+session_data = get_session_data()
+env = session_data['rl_env']
+dqn = session_data['rl_dqn']
+
+# Debug: Print current state every 10 frames
+if frame % 10 == 0:
+    print(f"Frame {frame}: Episode {session_data['rl_episode']}, State: {session_data['rl_state']}")
+
+# Always get current state for visualization
+state = session_data['rl_state']
+
+# Check if training is complete
+if session_data['rl_episode'] >= session_data['rl_max_episodes']:
+    # Training complete - just run inference
+    q_values = dqn.forward(state)
+    action = np.argmax(q_values)
+    next_state, reward, done = env.step(action)
+    
+    if done:
+        state = env.reset()
+        print(f"Inference: Episode ended, reset. New state: {state}")
+    else:
+        state = next_state
+    
+    session_data['rl_state'] = state
+    
+    # Add text attribute to show training is complete
+    if not geo.findPointAttrib("info"):
+        geo.addAttrib(hou.attribType.Point, "info", "")
+    geo.points()[0].setAttribValue("info", f"Training Complete - Running Trained Agent (Action: {action})")
+
+else:
+    # Continue training
+    if not session_data['rl_done']:
+        # Choose action (epsilon-greedy)
+        if random.random() < session_data['rl_epsilon']:
+            action = random.randint(0, 1)
+        else:
+            q_values = dqn.forward(state)
+            action = np.argmax(q_values)
+        
+        # Take step
+        next_state, reward, done = env.step(action)
+        
+        # Debug: Print when episode ends
+        if done:
+            print(f"Episode {session_data['rl_episode']} ended at step {session_data['rl_step']} with reward {session_data['rl_total_reward']}")
+        
+        # Train DQN
+        q_values = dqn.forward(state)
+        target = q_values.copy()
+        if done:
+            target[action] = reward
+        else:
+            target[action] = reward + session_data['rl_gamma'] * np.max(dqn.forward(next_state))
+        dqn.backward(state, target, q_values)
+        
+        # Update state
+        session_data['rl_state'] = next_state
+        session_data['rl_total_reward'] += reward
+        session_data['rl_step'] += 1
+        session_data['rl_done'] = done
+        
+        state = next_state  # Use updated state for visualization
+        
+    else:
+        # Episode finished, start new episode
+        session_data['rl_episode'] += 1
+        session_data['rl_epsilon'] = max(session_data['rl_epsilon_min'], 
+                                        session_data['rl_epsilon'] * session_data['rl_epsilon_decay'])
+        
+        print(f"Starting Episode {session_data['rl_episode']}, Final reward: {session_data['rl_total_reward']:.1f}, Epsilon: {session_data['rl_epsilon']:.3f}")
+        
+        # Reset for next episode
+        session_data['rl_state'] = env.reset()
+        session_data['rl_total_reward'] = 0
+        session_data['rl_step'] = 0
+        session_data['rl_done'] = False
+        
+        state = session_data['rl_state']  # Use new episode state
+
+    # Add training info as point attribute
+    if not geo.findPointAttrib("info"):
+        geo.addAttrib(hou.attribType.Point, "info", "")
+    info_text = f"Ep: {session_data['rl_episode']}/{session_data['rl_max_episodes']}, Step: {session_data['rl_step']}, R: {session_data['rl_total_reward']:.1f}"
+    geo.points()[0].setAttribValue("info", info_text)
+
+# Always update visualization with current state
+# Scale up positions for better visibility
+scale_factor = 5.0  # Make movements more visible
+cart_pos = hou.Vector3(state[0] * scale_factor, 0, 0)
+pole_tip_pos = hou.Vector3(
+    state[0] * scale_factor + env.length * scale_factor * np.sin(state[2]),
+    env.length * scale_factor * np.cos(state[2]),
+    0
+)
+
+# Set point positions
+geo.points()[0].setPosition(cart_pos)
+geo.points()[1].setPosition(pole_tip_pos)
+
+# Add velocity and angle info as attributes for debugging
+if not geo.findPointAttrib("cart_x"):
+    geo.addAttrib(hou.attribType.Point, "cart_x", 0.0)
+    geo.addAttrib(hou.attribType.Point, "cart_vel", 0.0)
+    geo.addAttrib(hou.attribType.Point, "pole_angle", 0.0)
+    geo.addAttrib(hou.attribType.Point, "pole_vel", 0.0)
+
+geo.points()[0].setAttribValue("cart_x", float(state[0]))
+geo.points()[0].setAttribValue("cart_vel", float(state[1]))
+geo.points()[0].setAttribValue("pole_angle", float(state[2]))
+geo.points()[0].setAttribValue("pole_vel", float(state[3]))
+
+# Debug print for first few frames
+if frame <= 5:
+    print(f"Frame {frame}: Cart at ({cart_pos.x():.3f}, 0, 0), Pole tip at ({pole_tip_pos.x():.3f}, {pole_tip_pos.y():.3f}, 0)")
+    print(f"  State: x={state[0]:.3f}, x_dot={state[1]:.3f}, theta={state[2]:.3f}, theta_dot={state[3]:.3f}")
+
+# Optional: Add function to manually reset training
+# Uncomment the line below if you want to reset training on this frame
+#reset_training()
