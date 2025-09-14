@@ -1,2 +1,2 @@
-# implementingdeeplearningforinvertedpenduluminhoudini
+# Implementing Deep Q Learning for Inverted Pendulum in Houdini
 In this repo, I have uploaded code required to implement DQN for inverted pendulum in Houdini. I have defined Cart-Pole environment from scratch without using any external libraries except for numpy. I have implemented DQN agent in this code. With training, the agent learns over time, adjusts weights with backpropagation and displays in houdini viewport. To avoid houdini from restarting code each frame, I have used session from hou API to keep data in memory consistently despite changing frames.
